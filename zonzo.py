@@ -11,7 +11,7 @@
 # FOR A PARTICULAR PURPOSE.
 #
 ##############################################################################
-"""Create WSGI‑based web applications (readable and lambda‑free)."""
+"""Create WSGI‑based web applications (cleaned, lambda‑free, optimised)."""
 
 __all__ = (
     'Application',
@@ -205,14 +205,14 @@ def _make_param_wrapper(handler, check, param_source):
 
     # First parameter is expected to be the request object
     # The remaining ones are filled from route_data or form/query/JSON
-    param_names = [param.name for param in params[1:]]
+    param_names = [p.name for p in params[1:]]
     required = set()
     defaults = {}
-    for param in params[1:]:
-        if param.default is inspect.Parameter.empty:
-            required.add(param.name)
+    for p in params[1:]:
+        if p.default is inspect.Parameter.empty:
+            required.add(p.name)
         else:
-            defaults[param.name] = param.default
+            defaults[p.name] = p.default
 
     def wrapper(request, **route_data):
         if check:
@@ -319,6 +319,12 @@ class Route:
         """Compatibility method used by the application."""
         return self.match_and_handle(request, path, method)
 
+    def __repr__(self):
+        methods = ', '.join(
+            sorted(self.methods)
+            ) if self.methods else 'any'
+        return f"<Route {self.pattern} [{methods}]>"
+
 
 # ---------------------------------------------------------------------------
 #  Subroute – matches a prefix and delegates to a nested resource
@@ -355,6 +361,9 @@ class Subroute:
     def bobo_response(self, request, path, method):
         """Compatibility method."""
         return self.match_and_handle(request, path, method)
+
+    def __repr__(self):
+        return f"<Subroute {self.pattern}>"
 
 
 # ---------------------------------------------------------------------------
@@ -710,7 +719,11 @@ def _import(module_name):
 
 
 def _get_global(attr):
-    """Resolve a string like 'module:expression' to a Python object."""
+    """Resolve a string like 'module:expression' to a Python object.
+
+    Note: This uses eval() for flexibility. In production, ensure the
+    configuration is trusted.
+    """
     if ':' not in attr:
         raise ValueError("No ':' in global name", attr)
     mod_name, expr = attr.split(':', 1)
@@ -762,6 +775,7 @@ def _create_method_route(route, method_map):
         )
 
 
+@lru_cache(maxsize=128)
 def _scan_module(module_name):
     """Yield resources (callables with bobo_response) found in a module."""
     mod = _import(module_name)
@@ -867,7 +881,8 @@ def redirect(
     content_type="text/html; charset=UTF-8"
     ):
     """Return a redirect response."""
-    body = f'See {url}' if body is None else body
+    if body is None:
+        body = f'See {url}'
     response = webob.Response(
         status=status, headerlist=[('Location', url)]
         )
@@ -900,10 +915,11 @@ class Application:
         bobo_errors = config.get('bobo_errors')
         if bobo_errors is not None:
             if isinstance(bobo_errors, str):
-                #     bobo_errors = _import(bobo_errors)
-                bobo_errors = _get_global(
-                    bobo_errors
-                    ) if ':' in bobo_errors else _import(bobo_errors)
+                bobo_errors = _uncomment(bobo_errors)
+                if ':' in bobo_errors:
+                    bobo_errors = _get_global(bobo_errors)
+                else:
+                    bobo_errors = _import(bobo_errors)
             for attr in (
                 'not_found', 'method_not_allowed',
                 'missing_form_variable', 'exception'
@@ -954,8 +970,8 @@ class Application:
         for handler in self.handlers:
             try:
                 result = handler(request, path, method)
-            except MethodNotAllowed as err:
-                allowed.update(err.allowed)
+            except MethodNotAllowed as exc:
+                allowed.update(exc.allowed)
                 continue
             if result is not None:
                 if isinstance(result, BoboException):
