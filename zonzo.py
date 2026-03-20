@@ -11,7 +11,7 @@
 # FOR A PARTICULAR PURPOSE.
 #
 ##############################################################################
-"""Create WSGI‑based web applications (no lambda version)."""
+"""Create WSGI‑based web applications (readable and lambda‑free)."""
 
 __all__ = (
     'Application',
@@ -304,8 +304,9 @@ class Route:
             return None
 
         route_data = {
-            k: v
-            for k, v in match.groupdict().items() if v is not None
+            key: value
+            for key, value in match.groupdict().items()
+            if value is not None
             }
         result = self._wrapper(request, **route_data)
 
@@ -338,8 +339,9 @@ class Subroute:
             return None
 
         route_data = {
-            k: v
-            for k, v in match.groupdict().items() if v is not None
+            key: value
+            for key, value in match.groupdict().items()
+            if value is not None
             }
         remaining = path[len(match.group(0)):]
 
@@ -582,8 +584,8 @@ def scan_class(cls):
             if method_set is None:
                 by_method[None] = (name, meth)
             else:
-                for m in method_set:
-                    by_method[m] = (name, meth)
+                for allowed_method in method_set:
+                    by_method[allowed_method] = (name, meth)
 
         regex, _ = _compile_route(route)
 
@@ -600,8 +602,9 @@ def scan_class(cls):
             if not match:
                 return None
             route_data = {
-                k: v
-                for k, v in match.groupdict().items() if v is not None
+                key: value
+                for key, value in match.groupdict().items()
+                if value is not None
                 }
             entry = by_method.get(method)
             if entry is None:
@@ -671,15 +674,19 @@ def preroute(route, resource):
 def resources(resources_list):
     """Combine multiple resources into one that tries them in order."""
     handlers = []
-    for res in resources_list:
-        if isinstance(res, str):
-            if ':' in res:
-                res = _get_global(res)
+    for resource_item in resources_list:
+        if isinstance(resource_item, str):
+            if ':' in resource_item:
+                resource_item = _get_global(resource_item)
             else:
-                res = _MultiResource(_scan_module(res))
-        elif not hasattr(res, 'bobo_response'):
-            res = _MultiResource(_scan_module(res.__name__))
-        handlers.append(res.bobo_response)
+                resource_item = _MultiResource(
+                    _scan_module(resource_item)
+                    )
+        elif not hasattr(resource_item, 'bobo_response'):
+            resource_item = _MultiResource(
+                _scan_module(resource_item.__name__)
+                )
+        handlers.append(resource_item.bobo_response)
 
     def combined_bobo_response(request, path, method):
         for handler in handlers:
@@ -813,14 +820,14 @@ def _route_config(lines):
     lines = lines[::-1]  # reverse for easy popping
     while lines:
         line = lines.pop()
-        m = _resource_re(line)
-        if m is None:
+        match_obj = _resource_re(line)
+        if match_obj is None:
             # Just a module or resource name
             route = line
             sep = None
             resource = None
         else:
-            route, sep, resource = m.groups()
+            route, sep, resource = match_obj.groups()
 
         if not resource:
             if not sep:
