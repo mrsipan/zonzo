@@ -867,8 +867,7 @@ def redirect(
     content_type="text/html; charset=UTF-8"
     ):
     """Return a redirect response."""
-    if body is None:
-        body = f'See {url}'
+    body = f'See {url}' if body is None else body
     response = webob.Response(
         status=status, headerlist=[('Location', url)]
         )
@@ -901,11 +900,10 @@ class Application:
         bobo_errors = config.get('bobo_errors')
         if bobo_errors is not None:
             if isinstance(bobo_errors, str):
-                bobo_errors = _uncomment(bobo_errors)
-                if ':' in bobo_errors:
-                    bobo_errors = _get_global(bobo_errors)
-                else:
-                    bobo_errors = _import(bobo_errors)
+                #     bobo_errors = _import(bobo_errors)
+                bobo_errors = _get_global(
+                    bobo_errors
+                    ) if ':' in bobo_errors else _import(bobo_errors)
             for attr in (
                 'not_found', 'method_not_allowed',
                 'missing_form_variable', 'exception'
@@ -956,8 +954,8 @@ class Application:
         for handler in self.handlers:
             try:
                 result = handler(request, path, method)
-            except MethodNotAllowed as exc:
-                allowed.update(exc.allowed)
+            except MethodNotAllowed as err:
+                allowed.update(err.allowed)
                 continue
             if result is not None:
                 if isinstance(result, BoboException):
