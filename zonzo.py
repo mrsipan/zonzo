@@ -3,7 +3,7 @@
 # Copyright Zope Foundation and Contributors.
 # All Rights Reserved.
 #
-# This software is subject to the provisions of the Zope Public License,
+# This software is subject to the terms of the Zope Public License,
 # Version 2.1 (ZPL).  A copy of the ZPL should accompany this distribution.
 # THIS SOFTWARE IS PROVIDED "AS IS" AND ANY AND ALL EXPRESS OR IMPLIED
 # WARRANTIES ARE DISCLAIMED, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
@@ -11,7 +11,7 @@
 # FOR A PARTICULAR PURPOSE.
 #
 ##############################################################################
-"""Create WSGI-based web applications (re‑implemented)."""
+"""Create WSGI‑based web applications (re‑implemented without lambda)."""
 
 __all__ = (
     'Application',
@@ -497,6 +497,7 @@ def options(
 def _subroute(route, obj, scan):
     if scan:
         scan_class(obj)
+
     if isinstance(obj, type):
         # Create a factory that instantiates the class
         def factory(request, **route_data):
@@ -512,10 +513,19 @@ def subroute(route=None, scan=False, order=None):
     """Decorator to create a nested route (sub‑application)."""
     if callable(route):
         return _subroute('/' + route.__name__, route, scan)
+
     if isinstance(route, str):
-        return lambda ob: _subroute(route, ob, scan)
+
+        def wrapper(ob):
+            return _subroute(route, ob, scan)
+
+        return wrapper
+
     # route is None → use decorated object's name
-    return lambda ob: _subroute('/' + ob.__name__, ob, scan)
+    def wrapper(ob):
+        return _subroute('/' + ob.__name__, ob, scan)
+
+    return wrapper
 
 
 def scan_class(cls):
@@ -620,7 +630,12 @@ def preroute(route, resource):
             resource = _MultiResource(_scan_module(resource))
     elif not hasattr(resource, 'bobo_response'):
         resource = _MultiResource(_scan_module(resource.__name__))
-    return Subroute(route, lambda request: resource)
+
+    # Create a factory that always returns the same resource
+    def factory(_request):
+        return resource
+
+    return Subroute(route, factory)
 
 
 def resources(resources_list):
@@ -636,16 +651,16 @@ def resources(resources_list):
             res = _MultiResource(_scan_module(res.__name__))
         handlers.append(res.bobo_response)
 
+    def combined_bobo_response(request, path, method):
+        for handler in handlers:
+            result = handler(request, path, method)
+            if result is not None:
+                return result
+        return None
+
     class Combined:
         __slots__ = ()
-        bobo_response = staticmethod(
-            lambda req, path, meth: next(
-                (
-                    r(req, path, meth) for r in handlers
-                    if r(req, path, meth) is not None
-                    ), None
-                )
-            )
+        bobo_response = staticmethod(combined_bobo_response)
 
     return Combined()
 
