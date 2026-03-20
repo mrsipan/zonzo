@@ -11,7 +11,7 @@
 # FOR A PARTICULAR PURPOSE.
 #
 ##############################################################################
-"""Create WSGI‑based web applications (re‑implemented without lambda)."""
+"""Create WSGI‑based web applications (no lambda version)."""
 
 __all__ = (
     'Application',
@@ -33,6 +33,7 @@ __all__ = (
 import inspect
 import json
 import logging
+import operator
 import re
 import sys
 import urllib
@@ -408,9 +409,13 @@ def resource(
         return _set_route_attrs(
             route, None, method, content_type, check, order, None
             )
-    return lambda f: _set_route_attrs(
-        f, route, method, content_type, check, order, None
-        )
+
+    def decorator(func):
+        return _set_route_attrs(
+            func, route, method, content_type, check, order, None
+            )
+
+    return decorator
 
 
 def post(
@@ -424,9 +429,13 @@ def post(
         return _set_route_attrs(
             route, None, ('POST', ), content_type, check, order, 'POST'
             )
-    return lambda f: _set_route_attrs(
-        f, route, ('POST', ), content_type, check, order, 'POST'
-        )
+
+    def decorator(func):
+        return _set_route_attrs(
+            func, route, ('POST', ), content_type, check, order, 'POST'
+            )
+
+    return decorator
 
 
 def query(
@@ -441,54 +450,75 @@ def query(
         return _set_route_attrs(
             route, None, method, content_type, check, order, 'params'
             )
-    return lambda f: _set_route_attrs(
-        f, route, method, content_type, check, order, 'params'
-        )
+
+    def decorator(func):
+        return _set_route_attrs(
+            func, route, method, content_type, check, order, 'params'
+            )
+
+    return decorator
 
 
 def get(
     route, content_type=_DEFAULT_CONTENT_TYPE, check=None, order=None
     ):
     """Shortcut for a GET resource."""
-    return lambda f: _set_route_attrs(
-        f, route, ('GET', ), content_type, check, order, 'params'
-        )
+    def decorator(func):
+        return _set_route_attrs(
+            func, route, ('GET', ), content_type, check, order, 'params'
+            )
+
+    return decorator
 
 
 def head(
     route, content_type=_DEFAULT_CONTENT_TYPE, check=None, order=None
     ):
     """Shortcut for a HEAD resource."""
-    return lambda f: _set_route_attrs(
-        f, route, ('HEAD', ), content_type, check, order, 'params'
-        )
+    def decorator(func):
+        return _set_route_attrs(
+            func, route, ('HEAD', ), content_type, check, order,
+            'params'
+            )
+
+    return decorator
 
 
 def put(
     route, content_type=_DEFAULT_CONTENT_TYPE, check=None, order=None
     ):
     """Shortcut for a PUT resource."""
-    return lambda f: _set_route_attrs(
-        f, route, ('PUT', ), content_type, check, order, 'POST'
-        )
+    def decorator(func):
+        return _set_route_attrs(
+            func, route, ('PUT', ), content_type, check, order, 'POST'
+            )
+
+    return decorator
 
 
 def delete(
     route, content_type=_DEFAULT_CONTENT_TYPE, check=None, order=None
     ):
     """Shortcut for a DELETE resource."""
-    return lambda f: _set_route_attrs(
-        f, route, ('DELETE', ), content_type, check, order, None
-        )
+    def decorator(func):
+        return _set_route_attrs(
+            func, route, ('DELETE', ), content_type, check, order, None
+            )
+
+    return decorator
 
 
 def options(
     route, content_type=_DEFAULT_CONTENT_TYPE, check=None, order=None
     ):
     """Shortcut for an OPTIONS resource."""
-    return lambda f: _set_route_attrs(
-        f, route, ('OPTIONS', ), content_type, check, order, 'params'
-        )
+    def decorator(func):
+        return _set_route_attrs(
+            func, route, ('OPTIONS', ), content_type, check, order,
+            'params'
+            )
+
+    return decorator
 
 
 # ---------------------------------------------------------------------------
@@ -593,7 +623,7 @@ def scan_class(cls):
         route_infos.append((min_order, route_handler))
 
     # Sort by order (lowest first)
-    route_infos.sort(key=lambda x: x[0])
+    route_infos.sort(key=operator.itemgetter(0))
 
     # Build the final bobo_response method
     def bobo_response(self, request, path, method):
