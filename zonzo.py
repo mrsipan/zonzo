@@ -205,14 +205,14 @@ def _make_param_wrapper(handler, check, param_source):
 
     # First parameter is expected to be the request object
     # The remaining ones are filled from route_data or form/query/JSON
-    param_names = [p.name for p in params[1:]]
+    param_names = [param.name for param in params[1:]]
     required = set()
     defaults = {}
-    for p in params[1:]:
-        if p.default is inspect.Parameter.empty:
-            required.add(p.name)
+    for param in params[1:]:
+        if param.default is inspect.Parameter.empty:
+            required.add(param.name)
         else:
-            defaults[p.name] = p.default
+            defaults[param.name] = param.default
 
     def wrapper(request, **route_data):
         if check:
