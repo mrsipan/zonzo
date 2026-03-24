@@ -72,10 +72,10 @@ class OptimizedRoute:
         if self.methods and request.method not in self.methods:
             return None
 
-        if (match := self.regex.match(request.path_info)):
+        if (matcher := self.regex.match(request.path_info)):
             return None
 
-        kwargs = match.groupdict()
+        kwargs = matcher.groupdict()
         source = getattr(request, self.plan.source_attr)
 
         # JSON Cache Check
