@@ -155,8 +155,8 @@ class Application:
         self.buckets = {}
         self.dynamics = []
         if resources:
-            for r in resources:
-                self.register(r)
+            for rz in resources:
+                self.register(rz)
 
     def register(self, fn):
         route = OptimizedRoute(fn, prefix=self.prefix)
@@ -172,9 +172,9 @@ class Application:
         seg = request.path_info.lstrip('/').split('/', 1)[0]
 
         for route in (self.buckets.get(seg, []) + self.dynamics):
-            resp = route.handle(request)
-            if resp:
-                return resp(environ, start_response)
+            rsp = route.handle(request)
+            if rsp:
+                return rsp(environ, start_response)
 
         return webob.exc.HTTPNotFound()(environ, start_response)
 
@@ -182,7 +182,7 @@ class Application:
     def from_module(cls, name, prefix=""):
         module = sys.modules[name]
         handlers = [
-            v
-            for v in vars(module).values() if hasattr(v, '_bobo_route')
+            value for value in vars(module).values()
+            if hasattr(v, '_bobo_route')
             ]
         return cls(handlers, prefix=prefix)
