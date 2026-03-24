@@ -50,11 +50,11 @@ class OptimizedRoute:
         self.methods = getattr(handler, '_bobo_methods', None)
 
         # Build Path with Prefix
-        raw_path = getattr(
+        path_raw = getattr(
             handler, '_bobo_route', '/' + handler.__name__
             )
         self.path = (prefix.rstrip('/') + '/' +
-                     raw_path.lstrip('/')).replace('//', '/')
+                     path_raw.lstrip('/')).replace('//', '/')
 
         self.plan = FunctionCallPlan(
             handler, getattr(handler, '_bobo_params', 'params')
