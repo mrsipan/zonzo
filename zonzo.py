@@ -171,8 +171,7 @@ class Application:
         seg = request.path_info.lstrip('/').split('/', 1)[0]
 
         for route in (self.buckets.get(seg, []) + self.dynamics):
-            rsp = route.handle(request)
-            if rsp:
+            if rsp := route.handle(request):
                 return rsp(environ, start_response)
 
         return webob.exc.HTTPNotFound()(environ, start_response)
