@@ -99,9 +99,7 @@ class OptimizedRoute:
                 webob.exc.HTTPBadRequest(
                     explanation=f"Missing: {name}"
                     )
-                ) if value is None else (
-                    (kwargs[name] := value) and None
-                    )
+                ) if value is None else kwargs.update({name: value})
 
         if isinstance(
             rv := self.handler(request, **kwargs),
@@ -183,6 +181,6 @@ class Application:
         module = sys.modules[name]
         handlers = [
             value for value in vars(module).values()
-            if hasattr(v, '_bobo_route')
+            if hasattr(value, '_bobo_route')
             ]
         return cls(handlers, prefix=prefix)
