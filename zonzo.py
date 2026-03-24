@@ -72,7 +72,9 @@ class OptimizedRoute:
         if self.methods and request.method not in self.methods:
             return None
 
-        if (matcher := self.regex.match(request.path_info)):
+        matcher = self.regex.match(request.path_info)
+
+        if matcher is None:
             return None
 
         kwargs = matcher.groupdict()
