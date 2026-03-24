@@ -12,14 +12,14 @@ import webob.exc
 
 
 class FunctionCallPlan:
-    """Pre-analyzes function signatures to avoid 'inspect' during requests."""
+    """Pre-analyzes function signatures to avoid 'inspect' during request_objects."""
     __slots__ = ('names_required', 'values_default', 'attr_source')
 
     def __init__(self, fn, attr_source='params'):
         sig = inspect.signature(fn)
         params = [*sig.parameters.values()]
 
-        # Assume first param is 'request', map the rest
+        # Assume first param is 'request_object', map the rest
         self.names_required = [
             param.name for param in params[1:]
             if param.default is inspect.Parameter.empty
@@ -68,22 +68,22 @@ class OptimizedRoute:
             )
         return re.compile(regex_string + '$')
 
-    def handle(self, request):
-        if self.methods and request.method not in self.methods:
+    def handle(self, request_object):
+        if self.methods and request_object.method not in self.methods:
             return None
 
-        matcher = self.regex.match(request.path_info)
+        matcher = self.regex.match(request_object.path_info)
 
         if matcher is None:
             return None
 
         kwargs = matcher.groupdict()
-        source = getattr(request, self.plan.attr_source)
+        source = getattr(request_object, self.plan.attr_source)
 
         # JSON Cache Check
         json_data = None
-        if request.content_type == 'application/json':
-            json_data = request.json
+        if request_object.content_type == 'application/json':
+            json_data = request_object.json
 
         for name in self.plan.names_required:
             if name in kwargs:
@@ -99,7 +99,7 @@ class OptimizedRoute:
                 ) if value is None else kwargs.update({name: value})
 
         if isinstance(
-            rv := self.handler(request, **kwargs),
+            rv := self.handler(request_object, **kwargs),
             webob.Response,
             ):
             return rv
@@ -162,11 +162,11 @@ class Application:
             self.dynamics.append(route)
 
     def __call__(self, environ, start_response):
-        request = webob.Request(environ)
-        seg = request.path_info.lstrip('/').split('/', 1)[0]
+        request_object = webob.Request(environ)
+        seg = request_object.path_info.lstrip('/').split('/', 1)[0]
 
         for route in (self.buckets.get(seg, []) + self.dynamics):
-            if rsp := route.handle(request):
+            if rsp := route.handle(request_object):
                 return rsp(environ, start_response)
 
         return webob.exc.HTTPNotFound()(environ, start_response)
