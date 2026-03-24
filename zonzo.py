@@ -1,1030 +1,248 @@
 ##############################################################################
 #
-# Copyright Zope Foundation and Contributors.
-# All Rights Reserved.
-#
-# This software is subject to the terms of the Zope Public License,
-# Version 2.1 (ZPL).  A copy of the ZPL should accompany this distribution.
-# THIS SOFTWARE IS PROVIDED "AS IS" AND ANY AND ALL EXPRESS OR IMPLIED
-# WARRANTIES ARE DISCLAIMED, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
-# WARRANTIES OF TITLE, MERCHANTABILITY, AGAINST INFRINGEMENT, AND FITNESS
-# FOR A PARTICULAR PURPOSE.
+# Optimized Web Framework (High-Performance "Bobo" Evolution)
+# Features: Segmented Routing, Precomputed Call Plans, Safe Path Resolution
 #
 ##############################################################################
-"""Create WSGI‑based web applications (cleaned, lambda‑free, optimised)."""
-
-__all__ = (
-    'Application',
-    'early',
-    'late',
-    'NotFound',
-    'order',
-    'post',
-    'preroute',
-    'query',
-    'redirect',
-    'reroute',
-    'resource',
-    'resources',
-    'scan_class',
-    'subroute',
-    )
 
 import inspect
-import json
 import logging
-import operator
 import re
-import sys
-import urllib
 from functools import lru_cache
 
 import webob
+import webob.exc
 
-log = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-#  Exceptions
-# ---------------------------------------------------------------------------
-class BoboException(Exception):
-    """Internal exception that carries a ready‑to‑render response."""
-
-    __slots__ = ('status', 'body', 'content_type', 'headers')
-
-    def __init__(
-        self,
-        status,
-        body,
-        content_type='text/html; charset=UTF-8',
-        headers=None
-        ):
-        self.status = status
-        self.body = body
-        self.content_type = content_type
-        self.headers = headers or []
-
-
-class MissingFormVariable(Exception):
-    """Raised when a required form/query variable is missing."""
-
-    __slots__ = ('name', )
-
-    def __init__(self, name):
-        self.name = name
-
-    def __str__(self):
-        return self.name
-
-
-class MethodNotAllowed(Exception):
-    """Raised when a resource does not support the requested HTTP method."""
-
-    __slots__ = ('allowed', )
-
-    def __init__(self, allowed):
-        self.allowed = sorted(allowed)
-
-    def __str__(self):
-        return f"Allowed: {', '.join(self.allowed)}"
-
-
-class NotFound(Exception):
-    """Raised when no resource matches the request URL."""
-
+# Initialize logging for the framework
+framework_logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-#  Ordering helpers
+#  Performance Core: The Call Plan
 # ---------------------------------------------------------------------------
-_order_counter = 0
-_LATE_BASE = 1 << 99
-_EARLY_BASE = -_LATE_BASE
 
 
-def order():
-    """Return an integer that can be used to order resources.
-
-    Each call returns a larger integer than the previous one.
+class FunctionCallPlan:
     """
-    global _order_counter
-    _order_counter += 1
-    return _order_counter
-
-
-def early():
-    """Return an order used for resources that should be searched early."""
-    return order() + _EARLY_BASE
-
-
-def late():
-    """Return an order used for resources that should be searched late."""
-    return order() + _LATE_BASE
-
-
-# ---------------------------------------------------------------------------
-#  Route compiler (regex builder)
-# ---------------------------------------------------------------------------
-@lru_cache(maxsize=1024)
-def _compile_route(route):
-    """Compile a route pattern into a regex and a list of named groups.
-
-    Route syntax: /:name? for optional, /:name for required, and optional
-    extension like .json after a placeholder.
+    Analyzes a function signature once at startup to create a 'cheat sheet'
+    for argument injection, bypassing the slow 'inspect' module at runtime.
     """
-    if not route.startswith('/'):
-        route = '/' + route
-
-    # Split into parts: prefix, placeholder, extension, prefix, ...
-    parts = re.split(r'(/:[a-zA-Z]\w*\??)(\.[^/]+)?', route)
-    prefix = parts.pop(0)
-    regex_parts = []
-    group_names = []
-
-    if prefix:
-        regex_parts.append(re.escape(prefix))
-
-    while parts:
-        placeholder = parts.pop(0)  # e.g. "/:name" or "/:name?"
-        extension = parts.pop(0) if parts else None
-
-        optional = placeholder.endswith('?')
-        name = placeholder[2:]  # remove "/:"
-        if optional:
-            name = name[:-1]  # remove trailing "?"
-        group_names.append(name)
-
-        # Build regex for this placeholder
-        part_re = r'/(?P<%s>[^/]*)' % name
-        if optional:
-            part_re = '(' + part_re + ')?'
-        regex_parts.append(part_re)
-
-        if extension:
-            regex_parts.append(re.escape(extension))
-
-        # Next literal string (if any)
-        if parts:
-            literal = parts.pop(0)
-            if literal:
-                regex_parts.append(re.escape(literal))
-
-    full_regex = ''.join(regex_parts) + '$'
-    return re.compile(full_regex), group_names
-
-
-# ---------------------------------------------------------------------------
-#  Route wrapper that handles parameter injection
-# ---------------------------------------------------------------------------
-def _make_simple_wrapper(handler, check):
-    """Wrap a function that only needs request and route data."""
-    def wrapper(request, **route_data):
-        if check:
-            result = check(None, request, handler)
-            if result is not None:
-                return result
-        return handler(request, **route_data)
-
-    return wrapper
-
-
-def _make_param_wrapper(handler, check, param_source):
-    """Wrap a function that needs form/query/JSON data as keyword arguments."""
-    sig = inspect.signature(handler)
-    params = list(sig.parameters.values())
-
-    if not params:
-        # No parameters at all
-        def wrapper(request, **route_data):
-            if check:
-                result = check(None, request, handler)
-                if result is not None:
-                    return result
-            return handler()
-
-        return wrapper
-
-    # First parameter is expected to be the request object
-    # The remaining ones are filled from route_data or form/query/JSON
-    param_names = [p.name for p in params[1:]]
-    required = set()
-    defaults = {}
-    for p in params[1:]:
-        if p.default is inspect.Parameter.empty:
-            required.add(p.name)
-        else:
-            defaults[p.name] = p.default
-
-    def wrapper(request, **route_data):
-        if check:
-            result = check(None, request, handler)
-            if result is not None:
-                return result
-
-        # Start with route_data
-        kwargs = {
-            name: value
-            for name, value in route_data.items() if name in param_names
-            }
-
-        # Get the parameter source (request.params or request.POST)
-        source = getattr(request, param_source)
-
-        # Cache JSON data if we ever need it
-        json_data = None
-        for name in param_names:
-            if name in kwargs:
-                continue
-
-            # Try from request.params / request.POST
-            values = source.getall(name)
-            if values:
-                if len(values) == 1:
-                    kwargs[name] = values[0]
-                else:
-                    kwargs[name] = values
-                continue
-
-            # Try from JSON body if content-type is application/json
-            if request.content_type == 'application/json':
-                if json_data is None:
-                    json_data = request.json
-                if name in json_data:
-                    kwargs[name] = json_data[name]
-                    continue
-
-            # If required and still missing, raise an error
-            if name in required:
-                raise MissingFormVariable(name)
-
-            # Otherwise, the default (from the function signature) will be used
-
-        return handler(request, **kwargs)
-
-    return wrapper
-
-
-# ---------------------------------------------------------------------------
-#  Route class – matches a URL path and calls the associated handler
-# ---------------------------------------------------------------------------
-class Route:
-    """A single route that matches a pattern and calls a handler."""
-
     __slots__ = (
-        'pattern', 'regex', 'group_names', 'handler', 'methods',
-        'param_source', 'check', 'content_type', '_wrapper'
+        'required_argument_names', 'default_values',
+        'parameter_source_attribute'
         )
 
     def __init__(
-        self, pattern, handler, methods, param_source, check,
-        content_type
+        self, handler_function, parameter_source_attribute='params'
         ):
-        self.pattern = pattern
-        self.regex, self.group_names = _compile_route(pattern)
-        self.handler = handler
-        self.methods = methods  # None or frozenset of allowed methods
-        self.param_source = param_source
-        self.check = check
-        self.content_type = content_type
+        function_signature = inspect.signature(handler_function)
+        parameters = list(function_signature.parameters.values())
 
-        # Pre‑create the call wrapper (once)
-        if param_source:
-            self._wrapper = _make_param_wrapper(
-                handler, check, param_source
-                )
-        else:
-            self._wrapper = _make_simple_wrapper(handler, check)
-
-    def match_and_handle(self, request, path, method):
-        """If the path matches and the method is allowed, return a response."""
-        if self.methods and method not in self.methods:
-            return None
-
-        match = self.regex.match(path)
-        if not match:
-            return None
-
-        route_data = {
-            key: value
-            for key, value in match.groupdict().items()
-            if value is not None
+        # We assume the first parameter is always the 'request' object.
+        # We map the rest.
+        self.required_argument_names = [
+            param.name for param in parameters[1:]
+            if param.default is inspect.Parameter.empty
+            ]
+        self.default_values = {
+            param.name: param.default
+            for param in parameters[1:]
+            if param.default is not inspect.Parameter.empty
             }
-        result = self._wrapper(request, **route_data)
-
-        if hasattr(result, '__call__'):
-            return result
-        # Wrap non‑response values as a 200 OK response
-        return BoboException(200, result, self.content_type)
-
-    def bobo_response(self, request, path, method):
-        """Compatibility method used by the application."""
-        return self.match_and_handle(request, path, method)
-
-    def __repr__(self):
-        methods = ', '.join(
-            sorted(self.methods)
-            ) if self.methods else 'any'
-        return f"<Route {self.pattern} [{methods}]>"
+        self.parameter_source_attribute = parameter_source_attribute
 
 
 # ---------------------------------------------------------------------------
-#  Subroute – matches a prefix and delegates to a nested resource
+#  The Optimized Route Object
 # ---------------------------------------------------------------------------
-class Subroute:
-    """A route that extracts a prefix and passes the remaining path to another resource."""
 
-    __slots__ = ('pattern', 'regex', 'group_names', 'resource_factory')
 
-    def __init__(self, pattern, resource_factory):
-        self.pattern = pattern
-        self.regex, self.group_names = _compile_route(pattern)
-        self.resource_factory = resource_factory
-
-    def match_and_handle(self, request, path, method):
-        match = self.regex.match(path)
-        if not match:
-            return None
-
-        route_data = {
-            key: value
-            for key, value in match.groupdict().items()
-            if value is not None
-            }
-        remaining = path[len(match.group(0)):]
-
-        resource = self.resource_factory(request, **route_data)
-        if resource is None:
-            return None
-
-        # The nested resource must have a bobo_response method
-        return resource.bobo_response(request, remaining, method)
-
-    def bobo_response(self, request, path, method):
-        """Compatibility method."""
-        return self.match_and_handle(request, path, method)
-
-    def __repr__(self):
-        return f"<Subroute {self.pattern}>"
-
-
-# ---------------------------------------------------------------------------
-#  Multi-resource (list of resources tried in order)
-# ---------------------------------------------------------------------------
-class _MultiResource(list):
-    """A list of resources that are tried in order until one returns a response."""
-    def bobo_response(self, request, path, method):
-        for resource in self:
-            result = resource(request, path, method)
-            if result is not None:
-                return result
-
-
-# ---------------------------------------------------------------------------
-#  Decorators
-# ---------------------------------------------------------------------------
-_DEFAULT_CONTENT_TYPE = 'text/html; charset=UTF-8'
-
-
-def _set_route_attrs(
-    func, route, methods, content_type, check, order_val, param_source
-    ):
-    """Attach route metadata to a callable."""
-    if route is None:
-        route = '/' + func.__name__
-        # If the content type has a subtype like "application/json", use it as extension
-        ext_match = re.search(r'/(\w+)', content_type)
-        if ext_match:
-            route += '.' + ext_match.group(1)
-    func._bobo_route = route
-    if methods is not None:
-        if isinstance(methods, str):
-            methods = (methods, )
-        func._bobo_methods = frozenset(methods)
-    else:
-        func._bobo_methods = None
-    func._bobo_content_type = content_type
-    func._bobo_check = check
-    func._bobo_order = order_val if order_val is not None else order()
-    func._bobo_params = param_source
-    return func
-
-
-def resource(
-    route=None,
-    method=('GET', 'POST', 'HEAD'),
-    content_type=_DEFAULT_CONTENT_TYPE,
-    check=None,
-    order=None
-    ):
-    """Decorator to define a resource with a route and allowed methods."""
-    if callable(route):
-        return _set_route_attrs(
-            route, None, method, content_type, check, order, None
-            )
-
-    def decorator(func):
-        return _set_route_attrs(
-            func, route, method, content_type, check, order, None
-            )
-
-    return decorator
-
-
-def post(
-    route=None,
-    content_type=_DEFAULT_CONTENT_TYPE,
-    check=None,
-    order=None
-    ):
-    """Decorator that injects POST form data as keyword arguments."""
-    if callable(route):
-        return _set_route_attrs(
-            route, None, ('POST', ), content_type, check, order, 'POST'
-            )
-
-    def decorator(func):
-        return _set_route_attrs(
-            func, route, ('POST', ), content_type, check, order, 'POST'
-            )
-
-    return decorator
-
-
-def query(
-    route=None,
-    method=('GET', 'POST', 'HEAD'),
-    content_type=_DEFAULT_CONTENT_TYPE,
-    check=None,
-    order=None
-    ):
-    """Decorator that injects query/form data as keyword arguments."""
-    if callable(route):
-        return _set_route_attrs(
-            route, None, method, content_type, check, order, 'params'
-            )
-
-    def decorator(func):
-        return _set_route_attrs(
-            func, route, method, content_type, check, order, 'params'
-            )
-
-    return decorator
-
-
-def get(
-    route, content_type=_DEFAULT_CONTENT_TYPE, check=None, order=None
-    ):
-    """Shortcut for a GET resource."""
-    def decorator(func):
-        return _set_route_attrs(
-            func, route, ('GET', ), content_type, check, order, 'params'
-            )
-
-    return decorator
-
-
-def head(
-    route, content_type=_DEFAULT_CONTENT_TYPE, check=None, order=None
-    ):
-    """Shortcut for a HEAD resource."""
-    def decorator(func):
-        return _set_route_attrs(
-            func, route, ('HEAD', ), content_type, check, order,
-            'params'
-            )
-
-    return decorator
-
-
-def put(
-    route, content_type=_DEFAULT_CONTENT_TYPE, check=None, order=None
-    ):
-    """Shortcut for a PUT resource."""
-    def decorator(func):
-        return _set_route_attrs(
-            func, route, ('PUT', ), content_type, check, order, 'POST'
-            )
-
-    return decorator
-
-
-def delete(
-    route, content_type=_DEFAULT_CONTENT_TYPE, check=None, order=None
-    ):
-    """Shortcut for a DELETE resource."""
-    def decorator(func):
-        return _set_route_attrs(
-            func, route, ('DELETE', ), content_type, check, order, None
-            )
-
-    return decorator
-
-
-def options(
-    route, content_type=_DEFAULT_CONTENT_TYPE, check=None, order=None
-    ):
-    """Shortcut for an OPTIONS resource."""
-    def decorator(func):
-        return _set_route_attrs(
-            func, route, ('OPTIONS', ), content_type, check, order,
-            'params'
-            )
-
-    return decorator
-
-
-# ---------------------------------------------------------------------------
-#  Subroute and class scanning
-# ---------------------------------------------------------------------------
-def _subroute(route, obj, scan):
-    if scan:
-        scan_class(obj)
-
-    if isinstance(obj, type):
-        # Create a factory that instantiates the class
-        def factory(request, **route_data):
-            return obj(request, **route_data)
-
-        return Subroute(route, factory)
-    else:
-        # obj is already a factory callable
-        return Subroute(route, obj)
-
-
-def subroute(route=None, scan=False, order=None):
-    """Decorator to create a nested route (sub‑application)."""
-    if callable(route):
-        return _subroute('/' + route.__name__, route, scan)
-
-    if isinstance(route, str):
-
-        def wrapper(ob):
-            return _subroute(route, ob, scan)
-
-        return wrapper
-
-    # route is None → use decorated object's name
-    def wrapper(ob):
-        return _subroute('/' + ob.__name__, ob, scan)
-
-    return wrapper
-
-
-def scan_class(cls):
-    """Add a bobo_response method to a class that dispatches to its decorated methods."""
-    # Gather all methods with _bobo_route metadata
-    route_map = {}
-    for base in reversed(inspect.getmro(cls)):
-        for name, value in base.__dict__.items():
-            if hasattr(value, '_bobo_route'):
-                route = value._bobo_route
-                route_map.setdefault(route, []).append((name, value))
-
-    # Build a dispatcher for each route
-    route_infos = []
-    for route, methods in route_map.items():
-        # Group by HTTP method
-        by_method = {}
-        min_order = None
-        for name, meth in methods:
-            order_val = getattr(meth, '_bobo_order', 0)
-            if min_order is None or order_val < min_order:
-                min_order = order_val
-            method_set = getattr(meth, '_bobo_methods', None)
-            if method_set is None:
-                by_method[None] = (name, meth)
-            else:
-                for allowed_method in method_set:
-                    by_method[allowed_method] = (name, meth)
-
-        regex, _ = _compile_route(route)
-
-        # Create a closure that captures the route data
-        def route_handler(
-            self,
-            request,
-            path,
-            method,
-            regex=regex,
-            by_method=by_method
-            ):
-            match = regex.match(path)
-            if not match:
-                return None
-            route_data = {
-                key: value
-                for key, value in match.groupdict().items()
-                if value is not None
-                }
-            entry = by_method.get(method)
-            if entry is None:
-                entry = by_method.get(None)
-            if entry is None:
-                allowed = set(by_method.keys())
-                if None in allowed:
-                    allowed.remove(None)
-                raise MethodNotAllowed(allowed)
-            name, meth = entry
-            result = getattr(self, name)(request, **route_data)
-            if hasattr(result, '__call__'):
-                return result
-            content_type = getattr(
-                meth, '_bobo_content_type', _DEFAULT_CONTENT_TYPE
-                )
-            return BoboException(200, result, content_type)
-
-        route_infos.append((min_order, route_handler))
-
-    # Sort by order (lowest first)
-    route_infos.sort(key=operator.itemgetter(0))
-
-    # Build the final bobo_response method
-    def bobo_response(self, request, path, method):
-        for _, handler in route_infos:
-            result = handler(self, request, path, method)
-            if result is not None:
-                return result
-        return None
-
-    cls.bobo_response = bobo_response
-    return cls
-
-
-# ---------------------------------------------------------------------------
-#  Resource composition helpers
-# ---------------------------------------------------------------------------
-def reroute(route, resource):
-    """Create a new resource by changing the route of an existing resource."""
-    if isinstance(resource, str):
-        resource = _get_global(resource)
-    if hasattr(resource, 'bobo_reroute'):
-        return resource.bobo_reroute(route)
-    if isinstance(resource, type):
-        return Subroute(route, resource)
-    raise TypeError("Expected a reroutable resource")
-
-
-def preroute(route, resource):
-    """Prefix a route to an existing resource (or module)."""
-    if isinstance(resource, str):
-        if ':' in resource:
-            resource = _get_global(resource)
-        else:
-            resource = _MultiResource(_scan_module(resource))
-    elif not hasattr(resource, 'bobo_response'):
-        resource = _MultiResource(_scan_module(resource.__name__))
-
-    # Create a factory that always returns the same resource
-    def factory(_request):
-        return resource
-
-    return Subroute(route, factory)
-
-
-def resources(resources_list):
-    """Combine multiple resources into one that tries them in order."""
-    handlers = []
-    for resource_item in resources_list:
-        if isinstance(resource_item, str):
-            if ':' in resource_item:
-                resource_item = _get_global(resource_item)
-            else:
-                resource_item = _MultiResource(
-                    _scan_module(resource_item)
-                    )
-        elif not hasattr(resource_item, 'bobo_response'):
-            resource_item = _MultiResource(
-                _scan_module(resource_item.__name__)
-                )
-        handlers.append(resource_item.bobo_response)
-
-    def combined_bobo_response(request, path, method):
-        for handler in handlers:
-            result = handler(request, path, method)
-            if result is not None:
-                return result
-        return None
-
-    class Combined:
-        __slots__ = ()
-        bobo_response = staticmethod(combined_bobo_response)
-
-    return Combined()
-
-
-# ---------------------------------------------------------------------------
-#  Module scanning and resource collection
-# ---------------------------------------------------------------------------
-def _import(module_name):
-    return __import__(module_name, {}, {}, ['*'])
-
-
-def _get_global(attr):
-    """Resolve a string like 'module:expression' to a Python object.
-
-    Note: This uses eval() for flexibility. In production, ensure the
-    configuration is trusted.
+class OptimizedRoute:
     """
-    if ':' not in attr:
-        raise ValueError("No ':' in global name", attr)
-    mod_name, expr = attr.split(':', 1)
-    mod = _import(mod_name)
-    return eval(expr, mod.__dict__)
-
-
-def _uncomment(text, split=False):
-    lines = [
-        line.split('#', 1)[0].strip()
-        for line in text.strip().split('\n')
-        ]
-    lines = [line for line in lines if line]
-    if split:
-        return lines
-    return '\n'.join(lines)
-
-
-def _create_method_route(route, method_map):
-    """Create a route that dispatches to different handlers based on HTTP method."""
-    wrappers = {}
-    for method, (handler, param_source, check, content_type,
-                 _) in method_map.items():
-        if param_source:
-            wrapper = _make_param_wrapper(handler, check, param_source)
-        else:
-            wrapper = _make_simple_wrapper(handler, check)
-        wrappers[method] = (wrapper, content_type)
-
-    def dispatcher(request, **route_data):
-        method = request.method
-        entry = wrappers.get(method)
-        if entry is None:
-            entry = wrappers.get(None)
-        if entry is None:
-            allowed = set(wrappers.keys())
-            if None in allowed:
-                allowed.remove(None)
-            raise MethodNotAllowed(allowed)
-        wrapper, content_type = entry
-        result = wrapper(request, **route_data)
-        if hasattr(result, '__call__'):
-            return result
-        return BoboException(200, result, content_type)
-
-    default_content_type = next(iter(method_map.values()))[3]
-    return Route(
-        route, dispatcher, None, None, None, default_content_type
+    A single route handler that encapsulates its own regex and injection plan.
+    """
+    __slots__ = (
+        'handler_callable', 'execution_plan', 'compiled_regex',
+        'allowed_methods', 'expected_content_type', 'route_path'
         )
 
-
-@lru_cache(maxsize=128)
-def _scan_module(module_name):
-    """Yield resources (callables with bobo_response) found in a module."""
-    mod = _import(module_name)
-    # If the module itself has a bobo_response, use it directly
-    if hasattr(mod, 'bobo_response'):
-        yield mod.bobo_response
-        return
-
-    # Collect all objects with _bobo_route metadata
-    resources = []
-    for obj in mod.__dict__.values():
-        if hasattr(obj, '_bobo_route'):
-            route = obj._bobo_route
-            methods = getattr(obj, '_bobo_methods', None)
-            content_type = getattr(
-                obj, '_bobo_content_type', _DEFAULT_CONTENT_TYPE
-                )
-            check = getattr(obj, '_bobo_check', None)
-            order_val = getattr(obj, '_bobo_order', 0)
-            param_source = getattr(obj, '_bobo_params', None)
-            resources.append(
-                (
-                    order_val, obj, route, methods, param_source, check,
-                    content_type
-                    )
-                )
-
-    # Group by route
-    by_route = {}
-    for order, handler, route, methods, param_source, check, content_type in resources:
-        by_route.setdefault(route, {})[methods] = (
-            handler, param_source, check, content_type, order
+    def __init__(self, handler_callable):
+        self.handler_callable = handler_callable
+        self.route_path = getattr(
+            handler_callable, '_bobo_route',
+            '/' + handler_callable.__name__
+            )
+        self.expected_content_type = getattr(
+            handler_callable, '_bobo_content_type',
+            'text/html; charset=UTF-8'
+            )
+        self.allowed_methods = getattr(
+            handler_callable, '_bobo_methods', None
             )
 
-    # Create Route objects (or method‑dispatched routes)
-    for route, method_map in by_route.items():
-        if len(method_map) == 1 and None in method_map:
-            handler, param_source, check, content_type, _ = method_map[
-                None]
-            yield Route(
-                route, handler, None, param_source, check, content_type
-                )
-        else:
-            yield _create_method_route(route, method_map)
+        # Determine if we should look at 'params' (GET/POST) or specifically 'POST'
+        source_attr = getattr(
+            handler_callable, '_bobo_params', 'params'
+            )
+        self.execution_plan = FunctionCallPlan(
+            handler_callable, source_attr
+            )
 
+        # Pre-compile the regex pattern
+        self.compiled_regex = self._compile_route_to_regex(
+            self.route_path
+            )
 
-# ---------------------------------------------------------------------------
-#  Configuration file parsing
-# ---------------------------------------------------------------------------
-_resource_re = re.compile(r'\s*([\S]+)\s*([-+]>)\s*(\S+)?\s*$').match
+    def _compile_route_to_regex(self, path_pattern):
+        """Converts Bobo-style /:var patterns into compiled regular expressions."""
+        if not path_pattern.startswith('/'):
+            path_pattern = '/' + path_pattern
 
+        # Replace /:name with named regex groups
+        regex_string = re.sub(
+            r'/:([a-zA-Z]\w*)', r'/(?P<\1>[^/]+)', path_pattern
+            )
+        return re.compile(regex_string + '$')
 
-def _route_config(lines):
-    """Parse the bobo_resources lines into a list of bobo_response callables."""
-    resources = []
-    lines = lines[::-1]  # reverse for easy popping
-    while lines:
-        line = lines.pop()
-        match_obj = _resource_re(line)
-        if match_obj is None:
-            # Just a module or resource name
-            route = line
-            sep = None
-            resource = None
-        else:
-            route, sep, resource = match_obj.groups()
+    def handle_request(self, request_object, current_path, http_method):
+        """
+        Attempts to match the path and method, then executes the handler.
+        Returns a WebOb Response if matched, otherwise None.
+        """
+        if self.allowed_methods and http_method not in self.allowed_methods:
+            return None
 
-        if not resource:
-            if not sep:
-                if ':' in route:
-                    resources.append(_get_global(route).bobo_response)
-                else:
-                    resources.extend(_scan_module(route))
-                continue
-            else:
-                # Continuation line
-                resource = lines.pop()
+        path_match = self.compiled_regex.match(current_path)
+        if not path_match:
+            return None
 
-        if sep == '->':
-            res = reroute(route, resource)
-        else:  # sep == '+>'
-            res = preroute(route, resource)
-        resources.append(res.bobo_response)
+        # 1. Start with values extracted directly from the URL path
+        handler_kwargs = path_match.groupdict()
 
-    return resources
+        # 2. Extract remaining required arguments from the primary data source
+        primary_data_source = getattr(
+            request_object,
+            self.execution_plan.parameter_source_attribute
+            )
 
-
-# ---------------------------------------------------------------------------
-#  Utility functions for responses and redirection
-# ---------------------------------------------------------------------------
-def _err_response(status, method, title, message, headers=None):
-    response = webob.Response(status=status, headerlist=headers or [])
-    response.content_type = 'text/html; charset=UTF-8'
-    if method != 'HEAD':
-        response.unicode_body = f"<html><head><title>{title}</title></head><body>{message}</body></html>"
-    return response
-
-
-def redirect(
-    url,
-    status=302,
-    body=None,
-    content_type="text/html; charset=UTF-8"
-    ):
-    """Return a redirect response."""
-    if body is None:
-        body = f'See {url}'
-    response = webob.Response(
-        status=status, headerlist=[('Location', url)]
-        )
-    response.content_type = content_type
-    response.unicode_body = body
-    return response
-
-
-# ---------------------------------------------------------------------------
-#  The main WSGI application
-# ---------------------------------------------------------------------------
-class Application:
-    """WSGI application that routes requests to registered resources."""
-    def __init__(self, DEFAULT=None, **config):
-        if DEFAULT:
-            config = dict(DEFAULT, **config)
-        self.config = config
-
-        # Run configure callbacks
-        bobo_configure = config.get('bobo_configure', '')
-        if isinstance(bobo_configure, str):
-            for name in filter(
-                None,
-                _uncomment(bobo_configure).split()
-                ):
-                configure = _get_global(name)
-                configure(config)
-
-        # Set up error handlers
-        bobo_errors = config.get('bobo_errors')
-        if bobo_errors is not None:
-            if isinstance(bobo_errors, str):
-                bobo_errors = _uncomment(bobo_errors)
-                if ':' in bobo_errors:
-                    bobo_errors = _get_global(bobo_errors)
-                else:
-                    bobo_errors = _import(bobo_errors)
-            for attr in (
-                'not_found', 'method_not_allowed',
-                'missing_form_variable', 'exception'
-                ):
-                if hasattr(bobo_errors, attr):
-                    setattr(self, attr, getattr(bobo_errors, attr))
-
-        # Parse resources
-        bobo_resources = config.get('bobo_resources', '')
-        if isinstance(bobo_resources, str):
-            bobo_resources = _uncomment(bobo_resources, split=True)
-            if bobo_resources:
-                self.handlers = _route_config(bobo_resources)
-            else:
-                raise ValueError("Missing bobo_resources option.")
-        else:
-            self.handlers = [r.bobo_response for r in bobo_resources]
-
-        # Exception handling flag
-        handle_exceptions = config.get('bobo_handle_exceptions', True)
-        if isinstance(handle_exceptions, str):
-            handle_exceptions = handle_exceptions.lower() == 'true'
-        self.reraise_exceptions = not handle_exceptions
-
-    def __call__(self, environ, start_response):
-        request = webob.Request(environ)
-        if request.charset is None:
-            request.charset = 'utf8'
-
-        try:
-            response = self.bobo_response(
-                request, request.path_info, request.method
-                )
-        except Exception:
-            # Let the WSGI server handle it if we are in reraise mode
-            if self.reraise_exceptions or environ.get(
-                'x-wsgiorg.throw_errors'
-                ):
-                raise
-            return self.exception(
-                request, request.method, sys.exc_info()
-                )(environ, start_response)
-
-        return response(environ, start_response)
-
-    def bobo_response(self, request, path, method):
-        allowed = set()
-        for handler in self.handlers:
+        # Optimization: Local reference to the cached JSON if content-type is JSON
+        json_payload = None
+        if request_object.content_type == 'application/json':
             try:
-                result = handler(request, path, method)
-            except MethodNotAllowed as exc:
-                allowed.update(exc.allowed)
+                json_payload = request_object.json
+            except ValueError:
+                return webob.exc.HTTPBadRequest(
+                    explanation="Invalid JSON payload"
+                    )
+
+        for argument_name in self.execution_plan.required_argument_names:
+            if argument_name in handler_kwargs:
                 continue
-            if result is not None:
-                if isinstance(result, BoboException):
-                    return self.build_response(request, method, result)
-                # Already a WSGI response
-                return result
-        if allowed:
-            return self.method_not_allowed(request, method, allowed)
-        return self.not_found(request, method)
 
-    def build_response(self, request, method, data):
-        """Convert a BoboException into a full WebOb response."""
-        response = webob.Response(
-            status=data.status, headerlist=data.headers
+            # Check primary source (form/query), fallback to JSON
+            value = primary_data_source.get(argument_name)
+            if value is None and json_payload is not None:
+                value = json_payload.get(argument_name)
+
+            if value is None:
+                return webob.exc.HTTPBadRequest(
+                    explanation=
+                    f"Missing required parameter: {argument_name}"
+                    )
+
+            handler_kwargs[argument_name] = value
+
+        # 3. Call the actual function
+        rv = self.handler_callable(request_object, **handler_kwargs)
+
+        # 4. Wrap the result in a proper response object
+        if isinstance(rv, webob.Response):
+            return rv
+
+        return webob.Response(
+            body=str(rv).encode('utf-8'),
+            content_type=self.expected_content_type
             )
-        response.content_type = data.content_type
 
-        if method == 'HEAD':
-            return response
 
-        body = data.body
-        if isinstance(body, str):
-            response.text = body
-        elif isinstance(body, bytes):
-            response.body = body
-        elif re.match(r'application/json', data.content_type):
-            response.body = json.dumps(body).encode('utf-8')
+# ---------------------------------------------------------------------------
+#  The Application Manager
+# ---------------------------------------------------------------------------
+
+
+class Application:
+    """
+    Main WSGI Entry point. Uses segmented routing to ensure O(1) or O(small N)
+    dispatch times even as the route count grows.
+    """
+    def __init__(self, resource_list=None):
+        # segmented_routes: { 'first_path_segment': [list_of_routes] }
+        self.segmented_routes = {}
+        self.dynamic_catchall_routes = []
+
+        if resource_list:
+            for resource in resource_list:
+                self.register_resource(resource)
+
+    def register_resource(self, resource_callable):
+        """Builds a route object and places it in the correct search bucket."""
+        route_instance = OptimizedRoute(resource_callable)
+
+        # Peek at the first segment of the path to categorize it
+        path_segments = route_instance.route_path.lstrip('/').split('/')
+        first_segment = path_segments[0]
+
+        if first_segment and not first_segment.startswith(':'):
+            if first_segment not in self.segmented_routes:
+                self.segmented_routes[first_segment] = []
+            self.segmented_routes[first_segment].append(route_instance)
         else:
-            raise TypeError(f'Unsupported response type: {type(body)}')
-        return response
+            # Routes starting with /:id or the root / go here
+            self.dynamic_catchall_routes.append(route_instance)
 
-    # Default error responses
-    def not_found(self, request, method):
-        return _err_response(
-            404, method, "Not Found",
-            f"Could not find: {urllib.parse.quote(request.path_info.encode('utf-8'))}"
+    def __call__(self, wsgi_environment, start_response_callback):
+        request = webob.Request(wsgi_environment)
+        current_path = request.path_info
+        http_method = request.method
+
+        # Performance optimization: Segmented lookup
+        # If path is /users/profile, we only search the 'users' bucket.
+        url_segments = current_path.lstrip('/').split('/', 1)
+        search_bucket = self.segmented_routes.get(url_segments[0], [])
+
+        # Search the categorized bucket, then the dynamic catch-alls
+        for route in (search_bucket + self.dynamic_catchall_routes):
+            response = route.handle_request(
+                request, current_path, http_method
+                )
+            if response is not None:
+                return response(
+                    wsgi_environment, start_response_callback
+                    )
+
+        # If no route found
+        error_404 = webob.exc.HTTPNotFound()
+        return error_404(wsgi_environment, start_response_callback)
+
+
+# ---------------------------------------------------------------------------
+#  Utilities: Safe Resource Resolution
+# ---------------------------------------------------------------------------
+
+
+def resolve_python_path_safely(path_string):
+    """
+    Resolves a 'module:attribute' string by walking the attribute tree.
+    Faster and safer than eval().
+    """
+    if ':' not in path_string:
+        raise ValueError(
+            "Path must be in 'module:object' or 'module:class.method' format."
             )
 
-    def missing_form_variable(self, request, method, name):
-        return _err_response(
-            403, method, "Missing parameter",
-            f'Missing form variable {name}'
-            )
+    module_name, attribute_chain = path_string.split(':', 1)
+    target_object = __import__(module_name, fromlist=['*'])
 
-    def method_not_allowed(self, request, method, methods):
-        return _err_response(
-            405, method, "Method Not Allowed",
-            f"Invalid request method: {method}",
-            [('Allow', ', '.join(sorted(methods)))]
-            )
+    for attribute_name in attribute_chain.split('.'):
+        target_object = getattr(target_object, attribute_name)
 
-    def exception(self, request, method, exc_info):
-        log.exception(request.url)
-        return _err_response(
-            500, method, "Internal Server Error", "An error occurred."
-            )
+    return target_object
