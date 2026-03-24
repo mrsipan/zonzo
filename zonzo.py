@@ -13,23 +13,23 @@ import webob.exc
 
 class FunctionCallPlan:
     """Pre-analyzes function signatures to avoid 'inspect' during requests."""
-    __slots__ = ('required_names', 'default_values', 'source_attr')
+    __slots__ = ('names_required', 'values_default', 'attr_source')
 
-    def __init__(self, fn, source_attr='params'):
+    def __init__(self, fn, attr_source='params'):
         sig = inspect.signature(fn)
         params = [*sig.parameters.values()]
 
         # Assume first param is 'request', map the rest
-        self.required_names = [
+        self.names_required = [
             param.name for param in params[1:]
             if param.default is inspect.Parameter.empty
             ]
-        self.default_values = {
+        self.values_default = {
             param.name: param.default
             for param in params[1:]
             if param.default is not inspect.Parameter.empty
             }
-        self.source_attr = source_attr
+        self.attr_source = attr_source
 
 
 # ---------------------------------------------------------------------------
@@ -78,24 +78,19 @@ class OptimizedRoute:
             return None
 
         kwargs = matcher.groupdict()
-        source = getattr(request, self.plan.source_attr)
+        source = getattr(request, self.plan.attr_source)
 
         # JSON Cache Check
         json_data = None
         if request.content_type == 'application/json':
             json_data = request.json
 
-        for name in self.plan.required_names:
+        for name in self.plan.names_required:
             if name in kwargs:
                 continue
             value = source.get(name) or (
                 json_data.get(name) if json_data else None
                 )
-            # if value is None:
-            #     return webob.exc.HTTPBadRequest(
-            #         explanation=f"Missing: {name}"
-            #         )
-            # kwargs[name] = value
 
             return (
                 webob.exc.HTTPBadRequest(
