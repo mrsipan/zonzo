@@ -152,9 +152,8 @@ class Application:
         self.prefix = prefix
         self.buckets = {}
         self.dynamics = []
-        if resources:
-            for rz in resources:
-                self.register(rz)
+        for rz in resources or ():
+            self.register(rz)
 
     def register(self, fn):
         route = OptimizedRoute(fn, prefix=self.prefix)
