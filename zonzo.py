@@ -17,17 +17,17 @@ class FunctionCallPlan:
 
     def __init__(self, fn, source_attr='params'):
         sig = inspect.signature(fn)
-        params = list(sig.parameters.values())
+        params = [*sig.parameters.values()]
 
         # Assume first param is 'request', map the rest
         self.required_names = [
-            p.name
-            for p in params[1:] if p.default is inspect.Parameter.empty
+            param.name for param in params[1:]
+            if param.default is inspect.Parameter.empty
             ]
         self.default_values = {
-            p.name: p.default
-            for p in params[1:]
-            if p.default is not inspect.Parameter.empty
+            param.name: param.default
+            for param in params[1:]
+            if param.default is not inspect.Parameter.empty
             }
         self.source_attr = source_attr
 
@@ -63,15 +63,16 @@ class OptimizedRoute:
 
     def _compile(self, path):
         # Converts /users/:id into a named regex group
-        regex_str = re.sub(r'/:([a-zA-Z]\w*)', r'/(?P<\1>[^/]+)', path)
-        return re.compile(regex_str + '$')
+        regex_string = re.sub(
+            r'/:([a-zA-Z]\w*)', r'/(?P<\1>[^/]+)', path
+            )
+        return re.compile(regex_string + '$')
 
     def handle(self, request):
         if self.methods and request.method not in self.methods:
             return None
 
-        match = self.regex.match(request.path_info)
-        if not match:
+        if (match := self.regex.match(request.path_info)):
             return None
 
         kwargs = match.groupdict()
@@ -85,14 +86,14 @@ class OptimizedRoute:
         for name in self.plan.required_names:
             if name in kwargs:
                 continue
-            val = source.get(name) or (
+            value = source.get(name) or (
                 json_data.get(name) if json_data else None
                 )
-            if val is None:
+            if value is None:
                 return webob.exc.HTTPBadRequest(
                     explanation=f"Missing: {name}"
                     )
-            kwargs[name] = val
+            kwargs[name] = value
 
         result = self.handler(request, **kwargs)
         if isinstance(result, webob.Response):
@@ -115,6 +116,7 @@ def _tag(
     content_type='text/html; charset=UTF-8',
     source='params'
     ):
+
     fn._bobo_route = route
     fn._bobo_methods = methods
     fn._bobo_content_type = content_type
