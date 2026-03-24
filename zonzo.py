@@ -89,17 +89,27 @@ class OptimizedRoute:
             value = source.get(name) or (
                 json_data.get(name) if json_data else None
                 )
-            if value is None:
-                return webob.exc.HTTPBadRequest(
+            # if value is None:
+            #     return webob.exc.HTTPBadRequest(
+            #         explanation=f"Missing: {name}"
+            #         )
+            # kwargs[name] = value
+
+            return (
+                webob.exc.HTTPBadRequest(
                     explanation=f"Missing: {name}"
                     )
-            kwargs[name] = value
+                ) if value is None else (
+                    (kwargs[name] := value) and None
+                    )
 
-        result = self.handler(request, **kwargs)
-        if isinstance(result, webob.Response):
-            return result
+        if isinstance(
+            rv := self.handler(request, **kwargs),
+            webob.Response,
+            ):
+            return rv
         return webob.Response(
-            body=str(result).encode('utf-8'),
+            body=str(rv).encode('utf-8'),
             content_type=self.content_type
             )
 
