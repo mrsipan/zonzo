@@ -1,248 +1,176 @@
-##############################################################################
-#
-# Optimized Web Framework (High-Performance "Bobo" Evolution)
-# Features: Segmented Routing, Precomputed Call Plans, Safe Path Resolution
-#
-##############################################################################
-
 import inspect
 import logging
 import re
-from functools import lru_cache
+import sys
 
 import webob
 import webob.exc
 
-# Initialize logging for the framework
-framework_logger = logging.getLogger(__name__)
-
 # ---------------------------------------------------------------------------
-#  Performance Core: The Call Plan
+#  1. The Call Plan (Zero-Reflection Runtime)
 # ---------------------------------------------------------------------------
 
 
 class FunctionCallPlan:
-    """
-    Analyzes a function signature once at startup to create a 'cheat sheet'
-    for argument injection, bypassing the slow 'inspect' module at runtime.
-    """
-    __slots__ = (
-        'required_argument_names', 'default_values',
-        'parameter_source_attribute'
-        )
+    """Pre-analyzes function signatures to avoid 'inspect' during requests."""
+    __slots__ = ('required_names', 'default_values', 'source_attr')
 
-    def __init__(
-        self, handler_function, parameter_source_attribute='params'
-        ):
-        function_signature = inspect.signature(handler_function)
-        parameters = list(function_signature.parameters.values())
+    def __init__(self, fn, source_attr='params'):
+        sig = inspect.signature(fn)
+        params = list(sig.parameters.values())
 
-        # We assume the first parameter is always the 'request' object.
-        # We map the rest.
-        self.required_argument_names = [
-            param.name for param in parameters[1:]
-            if param.default is inspect.Parameter.empty
+        # Assume first param is 'request', map the rest
+        self.required_names = [
+            p.name
+            for p in params[1:] if p.default is inspect.Parameter.empty
             ]
         self.default_values = {
-            param.name: param.default
-            for param in parameters[1:]
-            if param.default is not inspect.Parameter.empty
+            p.name: p.default
+            for p in params[1:]
+            if p.default is not inspect.Parameter.empty
             }
-        self.parameter_source_attribute = parameter_source_attribute
+        self.source_attr = source_attr
 
 
 # ---------------------------------------------------------------------------
-#  The Optimized Route Object
+#  2. Optimized Route & Execution
 # ---------------------------------------------------------------------------
 
 
 class OptimizedRoute:
-    """
-    A single route handler that encapsulates its own regex and injection plan.
-    """
     __slots__ = (
-        'handler_callable', 'execution_plan', 'compiled_regex',
-        'allowed_methods', 'expected_content_type', 'route_path'
+        'handler', 'plan', 'regex', 'methods', 'content_type', 'path'
         )
 
-    def __init__(self, handler_callable):
-        self.handler_callable = handler_callable
-        self.route_path = getattr(
-            handler_callable, '_bobo_route',
-            '/' + handler_callable.__name__
+    def __init__(self, handler, prefix=""):
+        self.handler = handler
+        self.content_type = getattr(
+            handler, '_bobo_content_type', 'text/html; charset=UTF-8'
             )
-        self.expected_content_type = getattr(
-            handler_callable, '_bobo_content_type',
-            'text/html; charset=UTF-8'
-            )
-        self.allowed_methods = getattr(
-            handler_callable, '_bobo_methods', None
-            )
+        self.methods = getattr(handler, '_bobo_methods', None)
 
-        # Determine if we should look at 'params' (GET/POST) or specifically 'POST'
-        source_attr = getattr(
-            handler_callable, '_bobo_params', 'params'
+        # Build Path with Prefix
+        raw_path = getattr(
+            handler, '_bobo_route', '/' + handler.__name__
             )
-        self.execution_plan = FunctionCallPlan(
-            handler_callable, source_attr
+        self.path = (prefix.rstrip('/') + '/' +
+                     raw_path.lstrip('/')).replace('//', '/')
+
+        self.plan = FunctionCallPlan(
+            handler, getattr(handler, '_bobo_params', 'params')
             )
+        self.regex = self._compile(self.path)
 
-        # Pre-compile the regex pattern
-        self.compiled_regex = self._compile_route_to_regex(
-            self.route_path
-            )
+    def _compile(self, path):
+        # Converts /users/:id into a named regex group
+        regex_str = re.sub(r'/:([a-zA-Z]\w*)', r'/(?P<\1>[^/]+)', path)
+        return re.compile(regex_str + '$')
 
-    def _compile_route_to_regex(self, path_pattern):
-        """Converts Bobo-style /:var patterns into compiled regular expressions."""
-        if not path_pattern.startswith('/'):
-            path_pattern = '/' + path_pattern
-
-        # Replace /:name with named regex groups
-        regex_string = re.sub(
-            r'/:([a-zA-Z]\w*)', r'/(?P<\1>[^/]+)', path_pattern
-            )
-        return re.compile(regex_string + '$')
-
-    def handle_request(self, request_object, current_path, http_method):
-        """
-        Attempts to match the path and method, then executes the handler.
-        Returns a WebOb Response if matched, otherwise None.
-        """
-        if self.allowed_methods and http_method not in self.allowed_methods:
+    def handle(self, request):
+        if self.methods and request.method not in self.methods:
             return None
 
-        path_match = self.compiled_regex.match(current_path)
-        if not path_match:
+        match = self.regex.match(request.path_info)
+        if not match:
             return None
 
-        # 1. Start with values extracted directly from the URL path
-        handler_kwargs = path_match.groupdict()
+        kwargs = match.groupdict()
+        source = getattr(request, self.plan.source_attr)
 
-        # 2. Extract remaining required arguments from the primary data source
-        primary_data_source = getattr(
-            request_object,
-            self.execution_plan.parameter_source_attribute
-            )
+        # JSON Cache Check
+        json_data = None
+        if request.content_type == 'application/json':
+            json_data = request.json
 
-        # Optimization: Local reference to the cached JSON if content-type is JSON
-        json_payload = None
-        if request_object.content_type == 'application/json':
-            try:
-                json_payload = request_object.json
-            except ValueError:
-                return webob.exc.HTTPBadRequest(
-                    explanation="Invalid JSON payload"
-                    )
-
-        for argument_name in self.execution_plan.required_argument_names:
-            if argument_name in handler_kwargs:
+        for name in self.plan.required_names:
+            if name in kwargs:
                 continue
-
-            # Check primary source (form/query), fallback to JSON
-            value = primary_data_source.get(argument_name)
-            if value is None and json_payload is not None:
-                value = json_payload.get(argument_name)
-
-            if value is None:
+            val = source.get(name) or (
+                json_data.get(name) if json_data else None
+                )
+            if val is None:
                 return webob.exc.HTTPBadRequest(
-                    explanation=
-                    f"Missing required parameter: {argument_name}"
+                    explanation=f"Missing: {name}"
                     )
+            kwargs[name] = val
 
-            handler_kwargs[argument_name] = value
-
-        # 3. Call the actual function
-        rv = self.handler_callable(request_object, **handler_kwargs)
-
-        # 4. Wrap the result in a proper response object
-        if isinstance(rv, webob.Response):
-            return rv
-
+        result = self.handler(request, **kwargs)
+        if isinstance(result, webob.Response):
+            return result
         return webob.Response(
-            body=str(rv).encode('utf-8'),
-            content_type=self.expected_content_type
+            body=str(result).encode('utf-8'),
+            content_type=self.content_type
             )
 
 
 # ---------------------------------------------------------------------------
-#  The Application Manager
+#  3. Decorators (Static Metadata Tagging)
+# ---------------------------------------------------------------------------
+
+
+def _tag(
+    fn,
+    route,
+    methods,
+    content_type='text/html; charset=UTF-8',
+    source='params'
+    ):
+    fn._bobo_route = route
+    fn._bobo_methods = methods
+    fn._bobo_content_type = content_type
+    fn._bobo_params = source
+    return fn
+
+
+def query(route, content_type='text/html; charset=UTF-8'):
+    return lambda f: _tag(
+        f, route, ('GET', 'POST', 'HEAD'), content_type, 'params'
+        )
+
+
+def post(route, content_type='application/json'):
+    return lambda f: _tag(f, route, ('POST', ), content_type, 'POST')
+
+
+# ---------------------------------------------------------------------------
+#  4. The Application (Segmented Routing Forest)
 # ---------------------------------------------------------------------------
 
 
 class Application:
-    """
-    Main WSGI Entry point. Uses segmented routing to ensure O(1) or O(small N)
-    dispatch times even as the route count grows.
-    """
-    def __init__(self, resource_list=None):
-        # segmented_routes: { 'first_path_segment': [list_of_routes] }
-        self.segmented_routes = {}
-        self.dynamic_catchall_routes = []
+    def __init__(self, resources=None, prefix=""):
+        self.prefix = prefix
+        self.buckets = {}
+        self.dynamics = []
+        if resources:
+            for r in resources:
+                self.register(r)
 
-        if resource_list:
-            for resource in resource_list:
-                self.register_resource(resource)
-
-    def register_resource(self, resource_callable):
-        """Builds a route object and places it in the correct search bucket."""
-        route_instance = OptimizedRoute(resource_callable)
-
-        # Peek at the first segment of the path to categorize it
-        path_segments = route_instance.route_path.lstrip('/').split('/')
-        first_segment = path_segments[0]
-
-        if first_segment and not first_segment.startswith(':'):
-            if first_segment not in self.segmented_routes:
-                self.segmented_routes[first_segment] = []
-            self.segmented_routes[first_segment].append(route_instance)
+    def register(self, fn):
+        route = OptimizedRoute(fn, prefix=self.prefix)
+        # O(1) Segment Partitioning
+        seg = route.path.lstrip('/').split('/')[0]
+        if seg and not seg.startswith(':'):
+            self.buckets.setdefault(seg, []).append(route)
         else:
-            # Routes starting with /:id or the root / go here
-            self.dynamic_catchall_routes.append(route_instance)
+            self.dynamics.append(route)
 
-    def __call__(self, wsgi_environment, start_response_callback):
-        request = webob.Request(wsgi_environment)
-        current_path = request.path_info
-        http_method = request.method
+    def __call__(self, environ, start_response):
+        request = webob.Request(environ)
+        seg = request.path_info.lstrip('/').split('/', 1)[0]
 
-        # Performance optimization: Segmented lookup
-        # If path is /users/profile, we only search the 'users' bucket.
-        url_segments = current_path.lstrip('/').split('/', 1)
-        search_bucket = self.segmented_routes.get(url_segments[0], [])
+        for route in (self.buckets.get(seg, []) + self.dynamics):
+            resp = route.handle(request)
+            if resp:
+                return resp(environ, start_response)
 
-        # Search the categorized bucket, then the dynamic catch-alls
-        for route in (search_bucket + self.dynamic_catchall_routes):
-            response = route.handle_request(
-                request, current_path, http_method
-                )
-            if response is not None:
-                return response(
-                    wsgi_environment, start_response_callback
-                    )
+        return webob.exc.HTTPNotFound()(environ, start_response)
 
-        # If no route found
-        error_404 = webob.exc.HTTPNotFound()
-        return error_404(wsgi_environment, start_response_callback)
-
-
-# ---------------------------------------------------------------------------
-#  Utilities: Safe Resource Resolution
-# ---------------------------------------------------------------------------
-
-
-def resolve_python_path_safely(path_string):
-    """
-    Resolves a 'module:attribute' string by walking the attribute tree.
-    Faster and safer than eval().
-    """
-    if ':' not in path_string:
-        raise ValueError(
-            "Path must be in 'module:object' or 'module:class.method' format."
-            )
-
-    module_name, attribute_chain = path_string.split(':', 1)
-    target_object = __import__(module_name, fromlist=['*'])
-
-    for attribute_name in attribute_chain.split('.'):
-        target_object = getattr(target_object, attribute_name)
-
-    return target_object
+    @classmethod
+    def from_module(cls, name, prefix=""):
+        module = sys.modules[name]
+        handlers = [
+            v
+            for v in vars(module).values() if hasattr(v, '_bobo_route')
+            ]
+        return cls(handlers, prefix=prefix)
