@@ -134,8 +134,17 @@ def query(route, content_type='text/html; charset=UTF-8'):
         )
 
 
+# def post(route, content_type='application/json'):
+#     return lambda f: _tag(f, route, ('POST', ), content_type, 'POST')
+
+
 def post(route, content_type='application/json'):
-    return lambda f: _tag(f, route, ('POST', ), content_type, 'POST')
+    print("calling post")
+
+    def function(fn):
+        _tag(fn, route, ('POST', ), content_type, 'POST')
+
+    return function
 
 
 # ---------------------------------------------------------------------------
@@ -155,6 +164,7 @@ class Application:
         route = OptimizedRoute(fn, prefix=self.prefix)
         # O(1) Segment Partitioning
         seg = route.path.lstrip('/').split('/')[0]
+        print('seg: ', seg)
         if seg and not seg.startswith(':'):
             self.buckets.setdefault(seg, []).append(route)
         else:
@@ -164,7 +174,7 @@ class Application:
         request_object = webob.Request(environ)
         seg = request_object.path_info.lstrip('/').split('/', 1)[0]
 
-        for route in (self.buckets.get(seg, []) + self.dynamics):
+        for route in [*self.buckets.get(seg, []), *self.dynamics]:
             if rsp := route.handle(request_object):
                 return rsp(environ, start_response)
 
