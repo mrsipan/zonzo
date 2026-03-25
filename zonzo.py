@@ -1,4 +1,5 @@
 import inspect
+import json
 import re
 import sys
 
@@ -11,7 +12,14 @@ import webob.exc
 
 
 class FunctionCallPlan:
-    """Pre-analyzes function signatures to avoid 'inspect' during request_objects."""
+    """
+    Pre-analyzes function signatures to avoid 'inspect' during request processing.
+
+    Attributes:
+        names_required (list): Arguments that must be provided from request data.
+        values_default (dict): Mapping of argument names to their default values.
+        attr_source (str): The WebOb request attribute (params, POST, etc.) to use.
+    """
     __slots__ = ('names_required', 'values_default', 'attr_source')
 
     def __init__(self, fn, attr_source='params'):
@@ -36,7 +44,10 @@ class FunctionCallPlan:
 # ---------------------------------------------------------------------------
 
 
-class OptimizedRoute:
+class Route:
+    """
+    Handles URL matching and automatic response generation based on return types.
+    """
     __slots__ = (
         'handler', 'plan', 'regex', 'methods', 'content_type', 'path'
         )
@@ -48,7 +59,6 @@ class OptimizedRoute:
             )
         self.methods = getattr(handler, '_bobo_methods', None)
 
-        # Build Path with Prefix
         path_raw = getattr(
             handler, '_bobo_route', '/' + handler.__name__
             )
@@ -61,50 +71,92 @@ class OptimizedRoute:
         self.regex = self._compile(self.path)
 
     def _compile(self, path):
-        # Converts /users/:id into a named regex group
+        """Converts /path/:id into a named regex group."""
         regex_string = re.sub(
             r'/:([a-zA-Z]\w*)', r'/(?P<\1>[^/]+)', path
             )
         return re.compile(regex_string + '$')
 
     def handle(self, request_object):
+        """
+        Executes the handler and transforms the return value into a Response.
+        """
         if self.methods and request_object.method not in self.methods:
             return None
 
         matcher = self.regex.match(request_object.path_info)
-
         if matcher is None:
             return None
 
         kwargs = matcher.groupdict()
         source = getattr(request_object, self.plan.attr_source)
 
-        # JSON Cache Check
+        # JSON Input Check
         json_data = None
         if request_object.content_type == 'application/json':
-            json_data = request_object.json
+            try:
+                json_data = request_object.json
+            except ValueError:
+                return webob.exc.HTTPBadRequest(
+                    explanation="Invalid JSON body"
+                    )
 
         for name in self.plan.names_required:
             if name in kwargs:
                 continue
-            value = source.get(name) or (
-                json_data.get(name) if json_data else None
-                )
 
-            return (
-                webob.exc.HTTPBadRequest(
+            value = source.get(name)
+            if value is None and json_data:
+                value = json_data.get(name)
+
+            if value is None:
+                return webob.exc.HTTPBadRequest(
                     explanation=f"Missing: {name}"
                     )
-                ) if value is None else kwargs.update({name: value})
+            kwargs[name] = value
 
-        if isinstance(
-            rv := self.handler(request_object, **kwargs),
-            webob.Response,
-            ):
+        # Execute Handler
+        rv = self.handler(request_object, **kwargs)
+
+        # --- Automatic Response Generation Logic ---
+
+        # 1. Direct Response
+        if isinstance(rv, webob.Response):
             return rv
-        return webob.Response(
-            body=str(rv).encode('utf-8'),
-            content_type=self.content_type
+
+        # 2. JSON Marshalling
+        if 'application/json' in self.content_type:
+            try:
+                body = json.dumps(rv).encode('utf-8')
+                return webob.Response(
+                    body=body, content_type=self.content_type
+                    )
+            except (TypeError, ValueError) as e:
+                raise TypeError(f"Failed to marshal JSON: {e}")
+
+        # 3. String Handling (Unicode/Bytes)
+        if isinstance(rv, (str, bytes)):
+            if isinstance(rv, bytes):
+                return webob.Response(
+                    body=rv, content_type=self.content_type
+                    )
+
+            # Determine encoding from content_type or default to UTF-8
+            charset_match = re.search(
+                r'charset=([\w-]+)', self.content_type
+                )
+            encoding = charset_match.group(
+                1
+                ) if charset_match else 'utf-8'
+            return webob.Response(
+                body=rv.encode(encoding),
+                content_type=self.content_type
+                )
+
+        # 4. Fallback: Bobo raises TypeError for non-string/non-response non-JSON
+        raise TypeError(
+            f"Handler {self.handler.__name__} returned unsupported type: {type(rv).__name__}. "
+            f"Expected Response, string, or JSON-serializable object."
             )
 
 
@@ -113,14 +165,7 @@ class OptimizedRoute:
 # ---------------------------------------------------------------------------
 
 
-def _tag(
-    fn,
-    route,
-    methods,
-    content_type='text/html; charset=UTF-8',
-    source='params'
-    ):
-
+def _tag(fn, route, methods, content_type, source):
     fn._bobo_route = route
     fn._bobo_methods = methods
     fn._bobo_content_type = content_type
@@ -129,22 +174,21 @@ def _tag(
 
 
 def query(route, content_type='text/html; charset=UTF-8'):
-    return lambda f: _tag(
-        f, route, ('GET', 'POST', 'HEAD'), content_type, 'params'
-        )
+    """Decorator for GET/POST requests, defaults to HTML output."""
+    def decorator(fn):
+        return _tag(
+            fn, route, ('GET', 'POST', 'HEAD'), content_type, 'params'
+            )
 
-
-# def post(route, content_type='application/json'):
-#     return lambda f: _tag(f, route, ('POST', ), content_type, 'POST')
+    return decorator
 
 
 def post(route, content_type='application/json'):
-    print("calling post")
+    """Decorator for POST requests, defaults to JSON output."""
+    def decorator(fn):
+        return _tag(fn, route, ('POST', ), content_type, 'POST')
 
-    def function(fn):
-        _tag(fn, route, ('POST', ), content_type, 'POST')
-
-    return function
+    return decorator
 
 
 # ---------------------------------------------------------------------------
@@ -153,6 +197,7 @@ def post(route, content_type='application/json'):
 
 
 class Application:
+    """WSGI Application using bucket-based routing for performance."""
     def __init__(self, resources=None, prefix=""):
         self.prefix = prefix
         self.buckets = {}
@@ -161,10 +206,8 @@ class Application:
             self.register(rz)
 
     def register(self, fn):
-        route = OptimizedRoute(fn, prefix=self.prefix)
-        # O(1) Segment Partitioning
+        route = Route(fn, prefix=self.prefix)
         seg = route.path.lstrip('/').split('/')[0]
-        print('seg: ', seg)
         if seg and not seg.startswith(':'):
             self.buckets.setdefault(seg, []).append(route)
         else:
