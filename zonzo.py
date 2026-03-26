@@ -15,18 +15,24 @@ class FunctionCallPlan:
     """
     Pre-analyzes function signatures to avoid 'inspect' during request processing.
 
-    Attributes:
-        names_required (list): Arguments that must be provided from request data.
-        values_default (dict): Mapping of argument names to their default values.
-        attr_source (str): The WebOb request attribute (params, POST, etc.) to use.
+    This optimization ensures that we only perform reflection once (at startup)
+    rather than on every single incoming HTTP request.
     """
     __slots__ = ('names_required', 'values_default', 'attr_source')
 
     def __init__(self, fn, attr_source='params'):
+        """
+        Extracts parameter metadata from a function.
+
+        Args:
+            fn: The handler function.
+            attr_source: The request attribute to check (e.g., 'params' or 'POST').
+        """
         sig = inspect.signature(fn)
         params = [*sig.parameters.values()]
 
-        # Assume first param is 'request_object', map the rest
+        # Bobo convention: The first parameter is always the request object.
+        # We map the remaining parameters to request data.
         self.names_required = [
             param.name for param in params[1:]
             if param.default is inspect.Parameter.empty
@@ -46,7 +52,8 @@ class FunctionCallPlan:
 
 class Route:
     """
-    Handles URL matching and automatic response generation based on return types.
+    Represents a URL route and handles the translation of HTTP requests
+    into function calls with automatic argument injection and response generation.
     """
     __slots__ = (
         'handler', 'plan', 'regex', 'methods', 'content_type', 'path'
@@ -71,7 +78,7 @@ class Route:
         self.regex = self._compile(self.path)
 
     def _compile(self, path):
-        """Converts /path/:id into a named regex group."""
+        """Converts Bobo-style paths (/:id) into regex named groups."""
         regex_string = re.sub(
             r'/:([a-zA-Z]\w*)', r'/(?P<\1>[^/]+)', path
             )
@@ -79,8 +86,9 @@ class Route:
 
     def handle(self, request_object):
         """
-        Executes the handler and transforms the return value into a Response.
+        Matches the request, extracts arguments from JSON/Params, and runs the handler.
         """
+        # 1. Method and Path Matching
         if self.methods and request_object.method not in self.methods:
             return None
 
@@ -88,43 +96,47 @@ class Route:
         if matcher is None:
             return None
 
+        # 2. Argument Extraction (Path -> JSON -> Query/Post)
         kwargs = matcher.groupdict()
-        source = getattr(request_object, self.plan.attr_source)
+        source_data = getattr(request_object, self.plan.attr_source)
 
-        # JSON Input Check
-        json_data = None
+        # JSON Request Body Handling:
+        # If the request is JSON, Bobo maps the top-level keys to function arguments.
+        json_data = {}
         if request_object.content_type == 'application/json':
             try:
+                # webob.Request.json property parses the body automatically
                 json_data = request_object.json
+                if not isinstance(json_data, dict):
+                    json_data = {}
             except ValueError:
                 return webob.exc.HTTPBadRequest(
-                    explanation="Invalid JSON body"
+                    explanation="Malformed JSON body"
                     )
 
         for name in self.plan.names_required:
             if name in kwargs:
                 continue
 
-            value = source.get(name)
-            if value is None and json_data:
-                value = json_data.get(name)
+            # Priority: Path Variables > JSON Keys > Query/POST Params
+            value = json_data.get(
+                name
+                ) if name in json_data else source_data.get(name)
 
             if value is None:
                 return webob.exc.HTTPBadRequest(
-                    explanation=f"Missing: {name}"
+                    explanation=f"Missing argument: {name}"
                     )
             kwargs[name] = value
 
-        # Execute Handler
+        # 3. Execution
         rv = self.handler(request_object, **kwargs)
 
-        # --- Automatic Response Generation Logic ---
-
-        # 1. Direct Response
+        # 4. Automatic Response Generation
         if isinstance(rv, webob.Response):
             return rv
 
-        # 2. JSON Marshalling
+        # JSON Response Marshalling
         if 'application/json' in self.content_type:
             try:
                 body = json.dumps(rv).encode('utf-8')
@@ -132,16 +144,15 @@ class Route:
                     body=body, content_type=self.content_type
                     )
             except (TypeError, ValueError) as e:
-                raise TypeError(f"Failed to marshal JSON: {e}")
+                raise TypeError(f"Failed to marshal JSON response: {e}")
 
-        # 3. String Handling (Unicode/Bytes)
+        # String/Unicode Response Handling
         if isinstance(rv, (str, bytes)):
             if isinstance(rv, bytes):
                 return webob.Response(
                     body=rv, content_type=self.content_type
                     )
 
-            # Determine encoding from content_type or default to UTF-8
             charset_match = re.search(
                 r'charset=([\w-]+)', self.content_type
                 )
@@ -153,10 +164,8 @@ class Route:
                 content_type=self.content_type
                 )
 
-        # 4. Fallback: Bobo raises TypeError for non-string/non-response non-JSON
         raise TypeError(
-            f"Handler {self.handler.__name__} returned unsupported type: {type(rv).__name__}. "
-            f"Expected Response, string, or JSON-serializable object."
+            f"Unsupported return type from handler: {type(rv).__name__}"
             )
 
 
@@ -166,6 +175,7 @@ class Route:
 
 
 def _tag(fn, route, methods, content_type, source):
+    """Internal helper to attach metadata for the Route class to read later."""
     fn._bobo_route = route
     fn._bobo_methods = methods
     fn._bobo_content_type = content_type
@@ -174,17 +184,14 @@ def _tag(fn, route, methods, content_type, source):
 
 
 def query(route, content_type='text/html; charset=UTF-8'):
-    """Decorator for GET/POST requests, defaults to HTML output."""
-    def decorator(fn):
-        return _tag(
-            fn, route, ('GET', 'POST', 'HEAD'), content_type, 'params'
-            )
-
-    return decorator
+    """Handles GET/POST. Defaults to HTML output and 'params' (Query+Post) source."""
+    return lambda f: _tag(
+        f, route, ('GET', 'POST', 'HEAD'), content_type, 'params'
+        )
 
 
 def post(route, content_type='application/json'):
-    """Decorator for POST requests, defaults to JSON output."""
+    """Handles POST only. Defaults to JSON output and 'POST' body source."""
     def decorator(fn):
         return _tag(fn, route, ('POST', ), content_type, 'POST')
 
@@ -192,12 +199,14 @@ def post(route, content_type='application/json'):
 
 
 # ---------------------------------------------------------------------------
-#  4. The Application (Segmented Routing Forest)
+#  4. The Application (Bucket Routing)
 # ---------------------------------------------------------------------------
 
 
 class Application:
-    """WSGI Application using bucket-based routing for performance."""
+    """
+    A WSGI application that uses a 'Routing Forest' (buckets) for O(1) lookup.
+    """
     def __init__(self, resources=None, prefix=""):
         self.prefix = prefix
         self.buckets = {}
@@ -206,6 +215,7 @@ class Application:
             self.register(rz)
 
     def register(self, fn):
+        """Registers a function by its first path segment."""
         route = Route(fn, prefix=self.prefix)
         seg = route.path.lstrip('/').split('/')[0]
         if seg and not seg.startswith(':'):
@@ -214,9 +224,11 @@ class Application:
             self.dynamics.append(route)
 
     def __call__(self, environ, start_response):
+        """WSGI entry point: Finds a matching route and returns its response."""
         request_object = webob.Request(environ)
         seg = request_object.path_info.lstrip('/').split('/', 1)[0]
 
+        # Check segment bucket first, then general dynamic routes
         for route in [*self.buckets.get(seg, []), *self.dynamics]:
             if rsp := route.handle(request_object):
                 return rsp(environ, start_response)
@@ -225,6 +237,7 @@ class Application:
 
     @classmethod
     def from_module(cls, name, prefix=""):
+        """Factory method to build an app from all tagged functions in a module."""
         module = sys.modules[name]
         handlers = [
             value for value in vars(module).values()
