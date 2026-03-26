@@ -31,17 +31,17 @@ Decorate functions with =@query= or =@post=. The first argument must always be t
 from zonzo import query, post
 
 @query("/hello/:name")
-def greet(request, name):
-"""Handles GET /hello/world -> 'Hello, world!'"""
-return f"Hello, {name}!"
+def greet(req, name):
+    """Handles GET /hello/world -> 'Hello, world!'
+    """
+    return f"Hello, {name}!"
 
 @post("/api/data", content_type="application/json")
-def process_data(request, item_id, quantity: int):
-"""
-Automatically parses JSON body: {"item_id": "A1", "quantity": 10}
-Returns a JSON response.
-"""
-return {"status": "processed", "id": item_id, "total": quantity}
+def process_data(req, item_id, quantity: int):
+    """Automatically parses JSON body: {"item_id": "A1", "quantity": 10}
+    Returns a JSON response.
+    """
+    return {"status": "processed", "id": item_id, "total": quantity}
 #+END_SRC
 
 
