@@ -56,24 +56,28 @@ class Route:
     into function calls with automatic argument injection and response generation.
     """
     __slots__ = (
-        'handler', 'plan', 'regex', 'methods', 'content_type', 'path'
+        'handler_function', 'plan', 'regex', 'methods', 'content_type',
+        'path'
         )
 
-    def __init__(self, handler, prefix=""):
-        self.handler = handler
+    def __init__(self, handler_function, prefix=""):
+        self.handler_function = handler_function
         self.content_type = getattr(
-            handler, '_bobo_content_type', 'text/html; charset=UTF-8'
+            handler_function, '_bobo_content_type',
+            'text/html; charset=UTF-8'
             )
-        self.methods = getattr(handler, '_bobo_methods', None)
+        self.methods = getattr(handler_function, '_bobo_methods', None)
 
         path_raw = getattr(
-            handler, '_bobo_route', '/' + handler.__name__
+            handler_function, '_bobo_route',
+            '/' + handler_function.__name__
             )
         self.path = (prefix.rstrip('/') + '/' +
                      path_raw.lstrip('/')).replace('//', '/')
 
         self.plan = FunctionCallPlan(
-            handler, getattr(handler, '_bobo_params', 'params')
+            handler_function,
+            getattr(handler_function, '_bobo_params', 'params')
             )
         self.regex = self._compile(self.path)
 
@@ -86,7 +90,7 @@ class Route:
 
     def handle(self, request_object):
         """
-        Matches the request, extracts arguments from JSON/Params, and runs the handler.
+        Matches the request, extracts arguments from JSON/Params, and runs the handler_function.
         """
         # 1. Method and Path Matching
         if self.methods and request_object.method not in self.methods:
@@ -130,7 +134,7 @@ class Route:
             kwargs[name] = value
 
         # 3. Execution
-        rv = self.handler(request_object, **kwargs)
+        rv = self.handler_function(request_object, **kwargs)
 
         # 4. Automatic Response Generation
         if isinstance(rv, webob.Response):
@@ -187,9 +191,12 @@ def _tag(fn, route, methods, content_type, source):
 
 def query(route, content_type='text/html; charset=UTF-8'):
     """Handles GET/POST. Defaults to HTML output and 'params' (Query+Post) source."""
-    return lambda f: _tag(
-        f, route, ('GET', 'POST', 'HEAD'), content_type, 'params'
-        )
+    def decorator(fn):
+        return _tag(
+            fn, route, ('GET', 'POST', 'HEAD'), content_type, 'params'
+            )
+
+    return decorator
 
 
 def post(route, content_type='application/json'):
