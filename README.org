@@ -1,0 +1,86 @@
+#+TITLE: Bobo-Lite: High-Performance Python Web Framework
+#+AUTHOR: Gemini
+#+OPTIONS: toc:2
+
+** Introduction
+
+Bobo-Lite is a minimalist, high-performance WSGI web framework inspired
+by the original Bobo library. It utilizes a Zero-Reflection Runtime via
+pre-calculated call plans and bucket-based routing to ensure $O(1)$ or
+near-$O(1)$ dispatching overhead.
+
+** Key Features
+
+- Zero-Reflection Runtime: Function signatures are inspected only once at registration.
+
+- Segmented Routing Forest: Routes are partitioned into buckets by their initial path segment for rapid lookup.
+
+- Automatic Response Generation: Transparently handles =dict= to JSON, =str= to HTTP body, and =webob.Response= objects.
+
+- Unified Parameter Injection: Automatically maps Path variables, JSON body keys, and Query/POST parameters to function arguments.
+
+- WebOb Powered: Built on the industry-standard =WebOb= request/response library.
+
+** Basic Usage
+
+*** Defining Resources
+
+Decorate functions with =@query= or =@post=. The first argument must always be the request object.
+
+#+BEGIN_SRC python
+from your_module import query, post
+
+@query("/hello/:name")
+def greet(request, name):
+"""Handles GET /hello/world -> 'Hello, world!'"""
+return f"Hello, {name}!"
+
+@post("/api/data", content_type="application/json")
+def process_data(request, item_id, quantity: int):
+"""
+Automatically parses JSON body: {"item_id": "A1", "quantity": 10}
+Returns a JSON response.
+"""
+return {"status": "processed", "id": item_id, "total": quantity}
+#+END_SRC
+
+
+*** Initializing the Application
+You can manually register resources or ingest an entire module.
+
+#+BEGIN_SRC python
+from your_module import Application
+
+# Option 1: Manual Registration
+app = Application([greet, process_data])
+
+# Option 2: Module Introspection
+app = Application.from_module(name)
+#+END_SRC
+
+** Andvanged Features
+
+*** JSON Mapping Priority
+When resolving function arguments, the framework follows this priority:
+
+1. Path Variables (e.g., =:id=)
+
+2. JSON Request Body (if =Content-Type: application/json=)
+
+3. Query/POST Parameters
+
+** Deployment
+Since it is a standard WSGI application, you can run it with any WSGI server:
+
+#+BEGIN_SRC shell
+gunicorn my_app:app
+#+END_SRC
+
+*** Content Type & Charset
+
+The framework respects the =charset= defined in the decorator. If a
+handler returns a string, it is encoded using the specified charset
+(defaulting to UTF-8).
+
+
+

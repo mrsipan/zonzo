@@ -143,8 +143,10 @@ class Route:
                 return webob.Response(
                     body=body, content_type=self.content_type
                     )
-            except (TypeError, ValueError) as e:
-                raise TypeError(f"Failed to marshal JSON response: {e}")
+            except (TypeError, ValueError) as err:
+                raise TypeError(
+                    f"Failed to marshal JSON response: {err}"
+                    )
 
         # String/Unicode Response Handling
         if isinstance(rv, (str, bytes)):
