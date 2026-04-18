@@ -96,8 +96,8 @@ class Route:
         if self.methods and request_object.method not in self.methods:
             return None
 
-        if matcher := self.regex.match(
-            request_object.path_info
+        if (
+            matcher := self.regex.match(request_object.path_info)
             ) is None:
             return None
 
