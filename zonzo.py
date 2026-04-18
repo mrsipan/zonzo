@@ -96,8 +96,9 @@ class Route:
         if self.methods and request_object.method not in self.methods:
             return None
 
-        matcher = self.regex.match(request_object.path_info)
-        if matcher is None:
+        if matcher := self.regex.match(
+            request_object.path_info
+            ) is None:
             return None
 
         # 2. Argument Extraction (Path -> JSON -> Query/Post)
@@ -111,12 +112,12 @@ class Route:
             try:
                 # webob.Request.json property parses the body automatically
                 json_data = request_object.json
-                if not isinstance(json_data, dict):
-                    json_data = {}
             except ValueError:
                 return webob.exc.HTTPBadRequest(
                     explanation="Malformed JSON body"
                     )
+            if not isinstance(json_data, dict):
+                json_data = {}
 
         for name in self.plan.names_required:
             if name in kwargs:
